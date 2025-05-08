@@ -1,3 +1,49 @@
+# OVERPASS API - MULTICORE ENHANCEMENT
+
 Please see
 http://wiki.osm.org/wiki/Overpass_API
 for the language documentation.
+
+Targets/Tasks:
+
+1. Review Current Dispatcher: Map out modules (network I/O, query planning, block locks) so they can be decoupled.
+
+2. Modularize Components: Refactor so that network I/O (socket handling) is separate from query processing and resource management. This prepares for concurrency.
+
+3. Set Up Thread Pool Skeleton: Create a fixed-size pool of worker thread. These threads will handle query execution. For example, create threads at startup. Use a thread-safe queue (e.g. a lock-free queue or a std::queue protected by a mutex/condition_variable) to hand off accepted sockets or query tasks from the acceptor to workers.
+
+4. Hand-off Mechanism: One acceptor thread that enqueues new connections for workers, or have all threads call epoll_wait() on the same epoll FD (with careful edge-trigger logic).
+
+5. Implementation of epoll-based event loop: The main thread (or all threads) calls epoll_wait to detect readable/writable sockets. For each ready event, dispatch it to a worker. For example, on new connection events, add the socket to a queue or directly register it for worker threads.
+
+6. Non-blocking I/O: Ensure all sockets are non-blocking. Use level-triggered epoll initially for simplicity.
+
+7. Connection Handling: On accept: the acceptor thread enqueues the new socket for a worker thread. Alternatively, if using shared epoll, all threads will receive the EPOLLIN event for the listener socket and can call accept() (with SO_REUSEPORT and thread-local epoll instances if desired for better CPU locality).
+
+8. Thread Pool Work: In each worker thread loop:
+
+- Take a socket or query from the queue.
+
+- If it’s a new socket: perform initial read of the HTTP or Overpass query.
+
+- If it’s an existing connection: continue reading/writing as per epoll events.
+
+- After reading a full request, release the socket and hand off the query to a query-processing task (within the same thread or via another queue).
+
+9. Decouple Query Planning: Separate query parsing/planning from I/O. When a complete query arrives, push it into another work queue for CPU-bound processing. Worker threads (or a separate pool) can pick these tasks. This lets I/O threads quickly go back to waiting for more network events. Use thread-safe queues (e.g. boost::lockfree::queue or std::queue with mutex) to pass tasks between I/O and worker threads. Minimize locking overhead; consider lock-free or wait-free data structures for high throughput.
+
+10. Resource Management: Ensure that the dispatcher’s logic for blocking writes (to avoid overwriting data blocks in use by readers) is thread-safe. Use mutexes or read-write locks to protect shared state (e.g. “which blocks are in use”).
+
+11. Memory Caching: With abundant RAM, cache frequently accessed data. For example:
+
+- In-memory Data Structures: Keep commonly used indices or parsed query results in memory. Use an LRU or hash cache keyed by query or data block. This avoids repeated disk reads.
+
+- Memory-mapped Files (Optional): Map the OSM database files into memory (mmap) so the OS will automatically cache hot pages. This can reduce system call overheadstackoverflow.com. Consider advising the kernel (e.g. madvise/readahead) to prefetch data. (Optional stretch: build a custom memory-mapped cache for critical DB tables.)
+
+12. I/O Optimizations: If using epoll and still doing file I/O, consider io_uring for asynchronous file reads/writes. This can reduce context switches and allow batching disk I/O with network handlingstackoverflow.com. If implemented, verify kernel version support.
+
+13. Load Balancing Threads: Tune the thread pool size based on benchmarks. Ensure threads do not become idle or overloaded. For example, pin threads to cores or adjust scheduling.
+
+14. Lock Contention: Profile for contention. If locks on shared resources (e.g. block-lock table) become a bottleneck, consider lock-free or sharded locks.
+
+15. Performance Measurement: Establish metrics (throughput, CPU usage, latency). Run stress tests (hundreds of clients, long-running queries) and compare to baseline. Measure how improvements (epoll vs select, caching) affect results.
